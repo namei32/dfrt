@@ -1,0 +1,45 @@
+__pycache__/
+*.py[cod]
+
+# Datasets, generated images, trained weights, and run artifacts.
+/data/
+/runs/
+/models/
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+
+# Pipeline-local heavy artifacts.
+generation/neu-det-pipeline/data/
+generation/neu-det-pipeline/.pytest_tmp/
+generation/neu-det-pipeline/outputs/
+generation/neu-det-pipeline/**/*.cache
+
+# Experiment outputs.
+experiments/logs/
+experiments/results/
+experiments/figures/
+
+# Local paper extraction scratch files.
+paper_ref.txt
+paper_ref_raw.txt
+tmp_measurement2026.txt
+.tmp/
+zotero_pdf_stage/
+zotero.sqlite*
+zotero_*.bib
+neudet_fields.tsv
+neudet_pdf_*.json
+neudet_pdf_unresolved.md
+neudet_zotero_items.json
+paper_context_aware_defect.txt
+pmc_dir.html
+pmc_test.xml
+
+# Misc local state.
+.venv/
+venv/
+.pytest_cache/
+ultralytics/
+*.log
