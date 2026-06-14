@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import torch
 from PIL import Image
 
 from neu_det_pipeline.data import collect_dataset_images, collect_dataset_instances
@@ -10,8 +11,11 @@ from neu_det_pipeline.guidance.drft import (
     build_class_aware_defect_residual_field,
     build_context_preserved_drft_contract,
     build_residual_seeded_canvas,
+    score_residual_bridge_alignment,
     score_drft_context_contract,
+    summarize_counterfactual_residual_bridge,
 )
+from neu_det_pipeline.models.drft_lora import DRFTAttentionContext
 
 
 def test_adaptive_counterfactual_canvas_returns_v2_metadata_and_mask() -> None:
@@ -54,6 +58,98 @@ def test_class_aware_residual_field_has_valid_channels() -> None:
     assert field.boundary_shell.shape == (128, 128)
     assert np.isfinite(field.signed_residual).all()
     assert float(np.abs(field.signed_residual).max()) > 1.0
+
+
+def test_counterfactual_residual_bridge_stats_are_localized() -> None:
+    clean = Image.fromarray(np.full((128, 128, 3), 128, dtype=np.uint8), mode="RGB")
+    mask = np.zeros((128, 128), dtype=np.uint8)
+    mask[28:100, 58:66] = 255
+    field = build_class_aware_defect_residual_field(
+        clean,
+        Image.fromarray(mask, mode="L"),
+        "scratches",
+        orientation_deg=90.0,
+        seed=19,
+    )
+
+    stats = summarize_counterfactual_residual_bridge(
+        field,
+        target_bbox=(58, 28, 66, 100),
+        target_size=(128, 128),
+    )
+
+    assert stats.variant == "counterfactual-defect-residual-bridge"
+    assert stats.residual_energy_bbox_fraction is not None
+    assert stats.residual_energy_bbox_fraction > 0.85
+    assert stats.residual_energy_core_fraction > stats.residual_energy_outside_fraction
+    assert stats.bridge_locality_score > 0.90
+    assert stats.orientation_coherence > 0.5
+
+
+def test_residual_bridge_alignment_rewards_matching_generated_residual() -> None:
+    clean_arr = np.full((96, 96, 3), 128, dtype=np.float32)
+    clean = Image.fromarray(clean_arr.astype(np.uint8), mode="RGB")
+    mask = np.zeros((96, 96), dtype=np.uint8)
+    mask[30:66, 40:56] = 255
+    field = build_class_aware_defect_residual_field(
+        clean,
+        Image.fromarray(mask, mode="L"),
+        "scratches",
+        orientation_deg=90.0,
+        seed=23,
+    )
+    generated_arr = np.clip(clean_arr + field.signed_residual[:, :, None], 0, 255)
+    generated = Image.fromarray(generated_arr.astype(np.uint8), mode="RGB")
+
+    alignment = score_residual_bridge_alignment(clean, generated, field)
+
+    assert alignment.sign_agreement > 0.95
+    assert alignment.generated_core_abs_mean > alignment.generated_outside_abs_mean
+    assert alignment.outside_to_core_ratio < 0.2
+    assert alignment.total > 0.65
+
+
+def test_drft_attention_context_summarizes_local_adaptation_trace() -> None:
+    context = DRFTAttentionContext(class_count=3)
+    residual_field = torch.zeros(1, 6, 16, 16)
+    residual_field[:, 0, 4:12, 4:12] = 1.0
+    residual_field[:, 4, 3:13, 3:13] = 0.5
+    context.set_condition(residual_field, torch.tensor([1]))
+
+    context.begin_trace(max_events=4)
+    spatial = context.spatial_gate(seq_len=16 * 16, batch=1, device=torch.device("cpu"), dtype=torch.float32)
+    for timestep in (800.0, 450.0, 100.0):
+        context.set_timestep(torch.tensor([timestep]))
+        time_features = context.time_features(batch=1, device=torch.device("cpu"), dtype=torch.float32)
+        context.record_adaptation_event(
+            expert_weights=torch.tensor([[0.15, 0.70, 0.15]]),
+            alpha=torch.tensor([[0.9]]),
+            spatial=spatial,
+            time_features=time_features,
+        )
+    summary = context.end_trace()
+
+    assert summary["enabled"] is True
+    assert summary["event_count"] == 3
+    assert summary["expert_weight_mean"][1] > 0.6
+    assert abs(summary["alpha_mean"] - 0.9) < 1e-5
+    assert summary["spatial_gate_mean"] is not None
+    assert summary["mid_weight_mean"] is not None
+    assert summary["phase_event_counts"]["early"] == 1
+    assert summary["phase_event_counts"]["mid"] == 1
+    assert summary["phase_event_counts"]["late"] == 1
+    assert summary["phase_summary"]["mid"]["spatial_gate_mean"] is not None
+
+
+def test_drft_attention_context_reports_enabled_trace_without_events() -> None:
+    context = DRFTAttentionContext(class_count=3)
+
+    context.begin_trace()
+    summary = context.end_trace()
+
+    assert summary["enabled"] is True
+    assert summary["event_count"] == 0
+    assert summary["warning"] == "trace_enabled_but_no_adaptation_events"
 
 
 def test_context_contract_preserves_protected_instance_area() -> None:

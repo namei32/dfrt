@@ -1,6 +1,5 @@
 ﻿from __future__ import annotations
 
-import json
 import logging
 import os
 from dataclasses import asdict
@@ -35,17 +34,15 @@ from ..guidance.drft import (
     build_context_preserved_drft_contract,
     build_residual_seeded_canvas,
     save_drft_artifacts,
+    score_residual_bridge_alignment,
     score_drft_context_contract,
     score_drft_candidate,
+    summarize_counterfactual_residual_bridge,
 )
-from ..guidance.mask import (
-    DefectType,
-    build_core_shell_masks,
-    create_composite_preserving_background,
-    generate_defect_mask,
-)
+from ..guidance.mask import create_composite_preserving_background
 from .drft_lora import (
     DRFTAttentionContext,
+    DRFTAttnProcessor2_0,
     is_drft_lora_path,
     load_drft_lora_into_unet,
     read_drft_lora_metadata,
@@ -242,21 +239,27 @@ class DRFTGenerator:
         embeddings_dir = Path(lora_path).parent.parent / "textual_inversion"
         if embeddings_dir.exists():
             self._load_textual_inversion_embeddings(pipe, embeddings_dir)
+        try:
+            pipe.disable_xformers_memory_efficient_attention()
+        except Exception:  # noqa: BLE001
+            pass
         context, metadata = load_drft_lora_into_unet(pipe.unet, lora_path)
         dtype = getattr(pipe.unet, "dtype", torch.float16)
         for processor in pipe.unet.attn_processors.values():
             if isinstance(processor, torch.nn.Module):
                 processor.to(dtype=dtype)
                 processor.eval()
-        try:
-            pipe.disable_xformers_memory_efficient_attention()
-        except Exception:  # noqa: BLE001
-            pass
         if torch.cuda.is_available():
             # DRFT installs custom attention processors after the pipeline is
             # created. Keeping the full pipeline on CUDA preserves those module
             # weights during inference; CPU offload can bypass their effect.
             pipe.to("cuda")
+        drft_processor_count = sum(
+            isinstance(processor, DRFTAttnProcessor2_0)
+            for processor in pipe.unet.attn_processors.values()
+        )
+        if drft_processor_count <= 0:
+            raise RuntimeError("DRFT-LoRA attention processors were not installed.")
         pipe.unet.eval()
         return pipe, context, metadata
 
@@ -395,6 +398,11 @@ class DRFTGenerator:
                         seed=candidate_seed,
                         prototype=prototype,
                     )
+                    residual_bridge = summarize_counterfactual_residual_bridge(
+                        field,
+                        target_bbox=scaled_bbox,
+                        target_size=target_size,
+                    )
                     context_contract = None
                     generation_mask = mask
                     inpaint_canvas = background_canvas
@@ -433,44 +441,73 @@ class DRFTGenerator:
                     )
                     generator = self._sample_generator(pipe, candidate_seed)
                     denoising_strength = self.cfg.denoising_strength
-                    with torch.inference_mode():
-                        output = pipe(
-                            prompt=base_prompt,
-                            image=inpaint_canvas,
-                            mask_image=generation_mask,
-                            num_inference_steps=self.cfg.num_inference_steps,
-                            guidance_scale=self.cfg.guidance_scale,
-                            strength=denoising_strength,
-                            generator=generator,
+                    context.begin_trace(max_events=96)
+                    try:
+                        with torch.inference_mode():
+                            output = pipe(
+                                prompt=base_prompt,
+                                image=inpaint_canvas,
+                                mask_image=generation_mask,
+                                num_inference_steps=self.cfg.num_inference_steps,
+                                guidance_scale=self.cfg.guidance_scale,
+                                strength=denoising_strength,
+                                generator=generator,
+                            )
+                    finally:
+                        adaptation_trace = context.end_trace()
+                    if adaptation_trace.get("enabled") and int(adaptation_trace.get("event_count") or 0) == 0:
+                        logger.warning(
+                            "DRFT residual-bridge adaptation trace recorded no events for %s candidate %d",
+                            stem,
+                            candidate_index,
                         )
                     generated = output.images[0].resize(target_size, Image.Resampling.LANCZOS)
                     final_image = create_composite_preserving_background(orig_resized, generated, generation_mask)
                     native_final_image = create_composite_preserving_background(orig_img, generated, generation_mask)
                     quality = score_drft_candidate(background_canvas, final_image, field)
+                    residual_bridge_alignment = score_residual_bridge_alignment(background_canvas, final_image, field)
                     context_quality = (
                         score_drft_context_contract(orig_resized, final_image, context_contract)
                         if context_contract is not None
                         else None
                     )
-                    selection_score = float(quality.total)
-                    selection_meta: dict[str, object] = {"mode": "quality-total", "defect_score": float(quality.total)}
+                    selection_score = 0.86 * float(quality.total) + 0.14 * float(residual_bridge_alignment.total)
+                    selection_meta: dict[str, object] = {
+                        "mode": "quality-bridge",
+                        "quality_total": float(quality.total),
+                        "residual_bridge_alignment_total": float(residual_bridge_alignment.total),
+                    }
                     if (
                         defect_first_selection
                         and (context_quality is not None or use_no_context_boost or residual_seed_gain > 0.0)
                     ):
-                        selection_score, selection_meta = _defect_first_selection(
+                        defect_selection_score, selection_meta = _defect_first_selection(
                             quality,
                             context_quality,
                             field,
                             generation_mask,
                             min_context_score=context_min_score if context_quality is not None else 0.0,
                         )
-                    elif context_quality is not None:
-                        selection_score = 0.72 * float(quality.total) + 0.28 * float(context_quality.total)
+                        selection_score = (
+                            0.86 * float(defect_selection_score)
+                            + 0.14 * float(residual_bridge_alignment.total)
+                        )
                         selection_meta = {
-                            "mode": "weighted-quality-context",
+                            **selection_meta,
+                            "base_selection_score": float(defect_selection_score),
+                            "residual_bridge_alignment_total": float(residual_bridge_alignment.total),
+                        }
+                    elif context_quality is not None:
+                        selection_score = (
+                            0.62 * float(quality.total)
+                            + 0.24 * float(context_quality.total)
+                            + 0.14 * float(residual_bridge_alignment.total)
+                        )
+                        selection_meta = {
+                            "mode": "weighted-quality-context-bridge",
                             "quality_total": float(quality.total),
                             "context_total": float(context_quality.total),
+                            "residual_bridge_alignment_total": float(residual_bridge_alignment.total),
                         }
                     candidate_name = f"{stem}_c{candidate_index:02d}"
                     candidate_path = candidate_dir / f"{candidate_name}.png"
@@ -534,6 +571,9 @@ class DRFTGenerator:
                         "selected": False,
                         **asdict(plan),
                         "residual_field": field_paths,
+                        "residual_bridge": asdict(residual_bridge),
+                        "residual_bridge_alignment": asdict(residual_bridge_alignment),
+                        "local_diffusion_adaptation": adaptation_trace,
                         "quality": asdict(quality),
                         "context_quality": asdict(context_quality) if context_quality is not None else None,
                         "native_resolution": {

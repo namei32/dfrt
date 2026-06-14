@@ -82,6 +82,45 @@ class DRFTCandidateQuality:
 
 
 @dataclass(frozen=True)
+class DRFTResidualBridgeStats:
+    """Evidence summary for the counterfactual defect residual bridge."""
+
+    variant: str
+    family: str
+    cls_name: str
+    mask_coverage: float
+    shell_coverage: float
+    active_residual_coverage: float
+    residual_abs_mean: float
+    residual_abs_p95: float
+    residual_energy_total: float
+    residual_energy_core_fraction: float
+    residual_energy_shell_fraction: float
+    residual_energy_outside_fraction: float
+    residual_energy_bbox_fraction: Optional[float]
+    bridge_locality_score: float
+    boundary_concentration: float
+    orientation_coherence: float
+    signed_balance: float
+    distance_weighted_energy: float
+
+
+@dataclass(frozen=True)
+class DRFTResidualBridgeAlignment:
+    """How well a generated candidate follows the intended residual bridge."""
+
+    total: float
+    sign_agreement: float
+    residual_correlation: float
+    locality_score: float
+    normalized_l1: float
+    generated_core_abs_mean: float
+    generated_shell_abs_mean: float
+    generated_outside_abs_mean: float
+    outside_to_core_ratio: float
+
+
+@dataclass(frozen=True)
 class DRFTContextContract:
     """Masks that define the context-preserved residual-topology edit region."""
 
@@ -679,6 +718,153 @@ def score_drft_candidate(
     )
 
 
+def summarize_counterfactual_residual_bridge(
+    field: DRFTResidualField,
+    *,
+    target_bbox: Optional[tuple[int, int, int, int]] = None,
+    target_size: Optional[tuple[int, int]] = None,
+) -> DRFTResidualBridgeStats:
+    """Quantify the residual bridge from pseudo-normal surface to defect appearance.
+
+    The summary is deliberately independent of a generated image. It measures
+    whether the field behaves like a localized, structured defect residual
+    instead of an uninformative mask.
+    """
+
+    soft = np.clip(field.soft_mask.astype(np.float32), 0.0, 1.0)
+    shell = np.clip(field.boundary_shell.astype(np.float32), 0.0, 1.0)
+    residual = field.signed_residual.astype(np.float32)
+    abs_residual = np.abs(residual)
+    height, width = soft.shape
+    core = soft >= 0.18
+    shell_region = shell >= 0.12
+    outside = np.logical_and(soft < 0.035, shell < 0.03)
+    active = abs_residual > 1.0
+    energy_total = float(abs_residual.sum())
+    denom = max(energy_total, 1e-6)
+
+    bbox_fraction: Optional[float] = None
+    if target_bbox is not None and target_size is not None:
+        src_w, src_h = target_size
+        if src_w > 0 and src_h > 0:
+            x0, y0, x1, y1 = target_bbox
+            bx0 = int(round(float(x0) * width / float(src_w)))
+            bx1 = int(round(float(x1) * width / float(src_w)))
+            by0 = int(round(float(y0) * height / float(src_h)))
+            by1 = int(round(float(y1) * height / float(src_h)))
+            bx0, by0, bx1, by1 = _clip_bbox((bx0, by0, bx1, by1), width, height)
+            bbox_mask = np.zeros((height, width), dtype=bool)
+            bbox_mask[by0:by1, bx0:bx1] = True
+            bbox_fraction = float(abs_residual[bbox_mask].sum() / denom) if bbox_mask.any() else 0.0
+
+    core_fraction = float(abs_residual[core].sum() / denom) if core.any() else 0.0
+    shell_fraction = float(abs_residual[shell_region].sum() / denom) if shell_region.any() else 0.0
+    outside_fraction = float(abs_residual[outside].sum() / denom) if outside.any() else 0.0
+    core_mean = float(abs_residual[core].mean()) if core.any() else 0.0
+    shell_mean = float(abs_residual[shell_region].mean()) if shell_region.any() else 0.0
+    boundary_concentration = float(shell_mean / max(core_mean, 1e-6))
+    orientation_x = np.clip(field.orientation_x.astype(np.float32), -1.0, 1.0)
+    orientation_y = np.clip(field.orientation_y.astype(np.float32), -1.0, 1.0)
+    orientation_mag = np.sqrt(
+        np.square(orientation_x)
+        + np.square(orientation_y)
+    )
+    weights = np.clip(soft + shell, 0.0, 1.0) * np.clip(abs_residual / max(float(abs_residual.max()), 1.0), 0.0, 1.0)
+    valid_orientation = orientation_mag > 1e-6
+    orientation_weights = weights * valid_orientation.astype(np.float32)
+    orientation_weight_sum = float(orientation_weights.sum())
+    if orientation_weight_sum > 0.0:
+        unit_x = np.divide(orientation_x, np.maximum(orientation_mag, 1e-6))
+        unit_y = np.divide(orientation_y, np.maximum(orientation_mag, 1e-6))
+        mean_x = float((unit_x * orientation_weights).sum() / orientation_weight_sum)
+        mean_y = float((unit_y * orientation_weights).sum() / orientation_weight_sum)
+        orientation_coherence = float(np.clip(math.sqrt(mean_x * mean_x + mean_y * mean_y), 0.0, 1.0))
+    else:
+        orientation_coherence = 0.0
+    signed_balance = float(residual.sum() / max(float(abs_residual.sum()), 1e-6))
+    distance = np.clip(field.distance.astype(np.float32), 0.0, 1.0)
+    distance_weighted_energy = float((abs_residual * (1.0 - distance)).sum() / denom)
+
+    return DRFTResidualBridgeStats(
+        variant="counterfactual-defect-residual-bridge",
+        family=field.family,
+        cls_name=field.cls_name,
+        mask_coverage=float(np.count_nonzero(soft >= 0.10) / float(max(1, soft.size))),
+        shell_coverage=float(np.count_nonzero(shell_region) / float(max(1, shell.size))),
+        active_residual_coverage=float(np.count_nonzero(active) / float(max(1, active.size))),
+        residual_abs_mean=float(abs_residual.mean()),
+        residual_abs_p95=float(np.percentile(abs_residual, 95)),
+        residual_energy_total=energy_total,
+        residual_energy_core_fraction=core_fraction,
+        residual_energy_shell_fraction=shell_fraction,
+        residual_energy_outside_fraction=outside_fraction,
+        residual_energy_bbox_fraction=bbox_fraction,
+        bridge_locality_score=float(math.exp(-outside_fraction / 0.12)),
+        boundary_concentration=boundary_concentration,
+        orientation_coherence=orientation_coherence,
+        signed_balance=float(np.clip(signed_balance, -1.0, 1.0)),
+        distance_weighted_energy=distance_weighted_energy,
+    )
+
+
+def score_residual_bridge_alignment(
+    clean_canvas: Image.Image,
+    generated: Image.Image,
+    field: DRFTResidualField,
+) -> DRFTResidualBridgeAlignment:
+    """Score whether a generated image realizes the intended residual bridge."""
+
+    size = clean_canvas.size
+    clean = np.asarray(clean_canvas.convert("L"), dtype=np.float32)
+    gen = np.asarray(generated.resize(size, Image.Resampling.LANCZOS).convert("L"), dtype=np.float32)
+    target = _resize_numeric_field(field.signed_residual, size)
+    soft = _resize_float_field(field.soft_mask, size)
+    shell = _resize_float_field(field.boundary_shell, size)
+    generated_residual = gen - clean
+    core = soft >= 0.18
+    shell_region = shell >= 0.12
+    outside = np.logical_and(soft < 0.035, shell < 0.03)
+    active_core = np.logical_and(core, np.abs(target) > 1.0)
+
+    if active_core.any():
+        gen_core = generated_residual[active_core]
+        target_core = target[active_core]
+        sign_agreement = float(np.mean(np.sign(gen_core) == np.sign(target_core)))
+        gen_centered = gen_core - float(gen_core.mean())
+        target_centered = target_core - float(target_core.mean())
+        corr_denom = float(np.linalg.norm(gen_centered) * np.linalg.norm(target_centered))
+        residual_correlation = float(np.dot(gen_centered, target_centered) / corr_denom) if corr_denom > 1e-6 else 0.0
+        normalized_l1 = float(np.mean(np.abs(gen_core - target_core)) / 255.0)
+    else:
+        sign_agreement = 0.0
+        residual_correlation = 0.0
+        normalized_l1 = 1.0
+
+    core_abs = np.abs(generated_residual[core])
+    shell_abs = np.abs(generated_residual[shell_region])
+    outside_abs = np.abs(generated_residual[outside])
+    core_mean = float(core_abs.mean() / 255.0) if core_abs.size else 0.0
+    shell_mean = float(shell_abs.mean() / 255.0) if shell_abs.size else 0.0
+    outside_mean = float(outside_abs.mean() / 255.0) if outside_abs.size else 0.0
+    outside_to_core = float(outside_mean / max(core_mean, 1e-6))
+    locality_score = float(math.exp(-outside_to_core / 0.35))
+    corr_score = float(np.clip((residual_correlation + 1.0) * 0.5, 0.0, 1.0))
+    l1_score = float(math.exp(-normalized_l1 / 0.16))
+    total = 0.34 * sign_agreement + 0.26 * corr_score + 0.24 * locality_score + 0.16 * l1_score
+
+    return DRFTResidualBridgeAlignment(
+        total=float(total),
+        sign_agreement=float(sign_agreement),
+        residual_correlation=float(residual_correlation),
+        locality_score=locality_score,
+        normalized_l1=float(normalized_l1),
+        generated_core_abs_mean=core_mean,
+        generated_shell_abs_mean=shell_mean,
+        generated_outside_abs_mean=outside_mean,
+        outside_to_core_ratio=outside_to_core,
+    )
+
+
 def build_residual_seeded_canvas(
     clean_canvas: Image.Image,
     field: DRFTResidualField,
@@ -901,7 +1087,6 @@ def build_class_aware_defect_residual_field(
     background = np.asarray(clean_canvas.convert("RGB"), dtype=np.float32)
     family = field.family
     soft = np.clip(field.soft_mask.astype(np.float32), 0.0, 1.0)
-    shell = np.clip(field.boundary_shell.astype(np.float32), 0.0, 1.0)
 
     if family in {"scratch", "crack"}:
         sharpened = np.clip(0.62 * np.power(soft, 0.88) + 0.38 * np.power(soft, 1.85), 0.0, 1.0)
@@ -1210,7 +1395,6 @@ def _prototype_from_pair(
     coverage = float((weak > 0.18).mean()) if weak.size else 0.0
     if coverage < 0.003 or coverage > 0.55:
         return None
-    gray_residual = diff_crop.mean(axis=2)
     orientation = _estimate_orientation_deg(weak)
     return DRFTResidualPrototype(
         key=getattr(sample, "target_key", sample.image_path.stem),
