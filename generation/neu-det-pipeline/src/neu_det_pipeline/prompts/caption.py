@@ -114,7 +114,7 @@ class CaptionGenerator:
         
         # 如果使用 CLIP 选择，需要加载图像
         if use_clip_selection:
-            from .data import load_image
+            from ..data import load_image
         
         for sample in track(samples, description="Generating paper-style captions"):
             stem = sample.image_path.stem

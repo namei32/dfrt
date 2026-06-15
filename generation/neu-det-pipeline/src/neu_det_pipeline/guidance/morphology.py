@@ -12,9 +12,6 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
 
 from ..data.loader import DefectSample
-from .mask import (
-    dilate_binary_mask,
-)
 
 
 @dataclass(frozen=True)
@@ -100,6 +97,12 @@ class MorphologyPrior:
             )
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(rows, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def dilate_binary_mask(mask: np.ndarray, iterations: int = 1, kernel_size: int = 3) -> np.ndarray:
+    kernel = np.ones((max(1, int(kernel_size)), max(1, int(kernel_size))), dtype=np.uint8)
+    binary = (np.asarray(mask) > 0).astype(np.uint8)
+    return cv2.dilate(binary, kernel, iterations=max(1, int(iterations))).astype(bool)
 
 
 def scale_bbox(

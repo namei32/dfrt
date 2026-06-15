@@ -4,8 +4,6 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
-import yaml
-
 
 @dataclass
 class DatasetConfig:
@@ -37,14 +35,6 @@ class LoRAConfig:
 
 
 @dataclass
-class GuidanceConfig:
-    hed_repo_id: str = "lllyasviel/Annotators"
-    midas_repo_id: str = "lllyasviel/Annotators"
-    hed_ckpt: str = "ControlNetHED.pth"
-    midas_ckpt: str = "dpt_hybrid-midas-501f0c75.pt"
-
-
-@dataclass
 class GenerationConfig:
     base_model: str = "runwayml/stable-diffusion-inpainting"
     prompt_template: str = "a photo of {token}"
@@ -60,7 +50,6 @@ class GenerationConfig:
 class ConfigBundle:
     dataset: DatasetConfig
     lora: LoRAConfig
-    guidance: GuidanceConfig
     generation: GenerationConfig
     source_path: Optional[Path] = None
 
@@ -109,13 +98,11 @@ def load_config_bundle(config_path: Optional[Path] = None) -> ConfigBundle:
     # Use dataclass defaults directly
     dataset_cfg = DatasetConfig()
     lora_cfg = LoRAConfig()
-    guidance_cfg = GuidanceConfig()
     generation_cfg = GenerationConfig()
 
     return ConfigBundle(
         dataset=dataset_cfg,
         lora=lora_cfg,
-        guidance=guidance_cfg,
         generation=generation_cfg,
         source_path=None,  # No YAML file source
     )

@@ -1,9 +1,9 @@
-"""Dataset loading helpers for the NEU defect pipeline."""
+"""Dataset loading and DRFT-v2 mixed-dataset utilities."""
 
 from .loader import (
-    DatasetSplits,
     DefectObject,
     DefectSample,
+    DatasetSplits,
     collect_dataset,
     collect_dataset_images,
     collect_dataset_instances,
@@ -16,12 +16,12 @@ from .loader import (
     load_pascal_voc_objects,
     split_dataset,
 )
-from .resplit import create_mixed_dataset
+from .resplit import create_mixed_dataset, source_stem_for_generated
 
 __all__ = [
-    "DatasetSplits",
     "DefectObject",
     "DefectSample",
+    "DatasetSplits",
     "collect_dataset",
     "collect_dataset_images",
     "collect_dataset_instances",
@@ -33,5 +33,6 @@ __all__ = [
     "load_image",
     "load_pascal_voc_annotation",
     "load_pascal_voc_objects",
+    "source_stem_for_generated",
     "split_dataset",
 ]

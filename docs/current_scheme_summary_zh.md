@@ -1,10 +1,28 @@
-# 当前保留方案
+# 当前保留方案：DRFT-v2
 
-Updated: 2026-06-10
+Updated: 2026-06-15
 
-当前工作区只保留 **DRFT-v2** 主线：先训练数据集专属 DRFT-LoRA，再使用 DRFT-v2 native 生成缺陷样本，最后构建 real-vs-mixed 数据集做正式检测器评估。
+当前工作区只保留 **DRFT-v2** 主线：
 
-## 保留内容
+```text
+数据集专属 DRFT-LoRA 训练 -> DRFT-v2 native 生成 -> real-vs-mixed 检测器评估
+```
+
+## 保留代码
+
+核心源码位于 `generation/neu-det-pipeline/src/neu_det_pipeline`：
+
+- `models/drft_lora.py`：训练残差场/时间步/类别条件的 DRFT-LoRA。
+- `models/generator.py`：使用 DRFT-v2 原生 inpainting 生成缺陷样本。
+- `guidance/drft.py`：构建 counterfactual canvas、缺陷残差场、context contract 与候选评分。
+- `guidance/morphology.py`：根据真实样本统计生成类别形态先验 mask。
+- `data/loader.py` 与 `data/resplit.py`：读取 Pascal VOC 样本，并构建 real+generated 混合数据集。
+- `prompts/`：生成 DRFT-v2 所需的类别 token prompt。
+- `cli.py`：只暴露 `prepare`、`caption`、`train-drft`、`generate`、`train-yolo` 五个主线命令。
+
+已删除 Reference-CMDP、Context-SGDA、DE-LGI、SRT、HDSI、HDSI-PD 等非当前方案代码。
+
+## 保留资产
 
 数据集专属 DRFT-LoRA 权重：
 
@@ -42,11 +60,18 @@ D:\drft-v2\data\NEU\formal_lora_native\neu_drft_lora_native_ratio_100_dataset\da
 D:\drft-v2\data\TILDA\formal_lora_native\tilda_drft_lora_native_ratio_100_dataset\data.yaml
 ```
 
-同目录下的 `ratio_0_dataset` 是对应真实 split 对照，用于 real-vs-mixed 检测对比。
+同目录下的 `ratio_0_dataset` 是真实数据对照，用于 real-vs-mixed 检测器对比。
 
 ## 入口约束
 
-`generation/neu-det-pipeline` 的生成入口只保留 `drft-v2` 模式。正式 runner 使用：
+生成侧 CLI 只保留 `drft-v2` 模式：
+
+```powershell
+cd generation\neu-det-pipeline
+neu-det generate <dataset_root> <guidance_dir> <drft_lora.safetensors> --mode drft-v2 --generation-split train --balanced-max-samples --drft-candidates 3 --make-mixed-dataset
+```
+
+正式 runner：
 
 ```powershell
 .\experiments\run_four_dataset_lora_native_formal.ps1

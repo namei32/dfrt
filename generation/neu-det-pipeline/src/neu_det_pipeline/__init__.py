@@ -11,7 +11,6 @@ from .config import (
     ConfigBundle,
     DatasetConfig,
     GenerationConfig,
-    GuidanceConfig,
     LoRAConfig,
     load_config_bundle,
 )
@@ -21,7 +20,6 @@ __all__ = [
     "ConfigBundle",
     "DatasetConfig",
     "GenerationConfig",
-    "GuidanceConfig",
     "LoRAConfig",
     "load_config_bundle",
 ]
