@@ -15,6 +15,12 @@ from neu_det_pipeline.guidance.drft import (
     score_drft_context_contract,
     summarize_counterfactual_residual_bridge,
 )
+from neu_det_pipeline.models.background_projector import (
+    BackgroundProjectorConfig,
+    BoxAwareBackgroundProjector,
+    apply_background_projector,
+    build_background_projector_features,
+)
 from neu_det_pipeline.models.drft_lora import DRFTAttentionContext
 
 
@@ -252,6 +258,48 @@ def test_residual_seeded_canvas_uses_confidence_guidance() -> None:
     assert meta["enabled"] is True
     assert meta["confidence_guided"] is True
     assert float(diff[34:62, 43:53].mean()) > float(diff[mask > 0].mean()) * 0.45
+
+
+def test_background_projector_preserves_outside_box_and_reports_maps() -> None:
+    base = np.full((64, 64, 3), 118, dtype=np.uint8)
+    base[:, :, 1] = np.linspace(80, 160, 64, dtype=np.uint8)[None, :]
+    image = Image.fromarray(base, mode="RGB")
+    bbox = (20, 18, 44, 46)
+    erase = np.zeros((64, 64), dtype=np.uint8)
+    erase[24:40, 26:38] = 255
+    erase_mask = Image.fromarray(erase, mode="L")
+
+    features, masks = build_background_projector_features(
+        image,
+        bbox,
+        erase_mask=erase_mask,
+        resolution=64,
+    )
+
+    assert features.shape == (8, 64, 64)
+    assert masks["box_mask"].shape == (1, 64, 64)
+    assert masks["erase_mask"].max() > 0
+
+    model = BoxAwareBackgroundProjector(base_channels=8)
+    cfg = BackgroundProjectorConfig(resolution=64, base_channels=8, fallback_blend=False)
+    result = apply_background_projector(
+        model,
+        cfg,
+        image,
+        bbox,
+        erase_mask=erase_mask,
+        fallback_canvas=image,
+    )
+
+    assert result.background.size == image.size
+    assert result.uncertainty.size == image.size
+    assert result.protect_mask.size == image.size
+    assert result.meta["enabled"] is True
+    box = np.asarray(masks["box_mask"].squeeze(0).numpy()) > 0
+    result_arr = np.asarray(result.background)
+    source_arr = np.asarray(image)
+    outside_delta = np.abs(result_arr[~box].astype(np.int16) - source_arr[~box].astype(np.int16))
+    assert outside_delta.max() == 0
 
 
 def test_instance_loader_expands_all_voc_objects(tmp_path) -> None:

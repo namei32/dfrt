@@ -40,6 +40,7 @@ from ..guidance.drft import (
     summarize_counterfactual_residual_bridge,
 )
 from ..guidance.mask import create_composite_preserving_background
+from .background_projector import apply_background_projector, load_background_projector
 from .drft_lora import (
     DRFTAttentionContext,
     DRFTAttnProcessor2_0,
@@ -284,12 +285,19 @@ class DRFTGenerator:
         residual_seed_gain: float = 0.0,
         context_min_score: float = 0.985,
         defect_first_selection: bool = True,
+        background_projector_path: Optional[Path] = None,
     ) -> List[Path]:
         """Full DRFT-LoRA: residual-field/timestep-gated LoRA inside SD inpainting U-Net."""
 
         _ = conditioning
         output_dir.mkdir(parents=True, exist_ok=True)
         pipe, context, metadata = self._build_drft_lora_pipeline(lora_path)
+        background_projector: tuple[Any, Any, dict[str, Any]] | None = None
+        if background_projector_path is not None:
+            background_projector_path = Path(background_projector_path)
+            if not background_projector_path.exists():
+                raise FileNotFoundError(f"Background projector checkpoint not found: {background_projector_path}")
+            background_projector = load_background_projector(background_projector_path, device="cpu")
 
         variant_lc = variant.lower().replace("_", "-")
         use_no_context_boost = variant_lc in {
@@ -321,9 +329,23 @@ class DRFTGenerator:
         seed_dir = artifacts_dir / "seed_canvas"
         erase_dir = artifacts_dir / "erase_masks"
         clean_dir = artifacts_dir / "clean_canvas"
+        bg_uncertainty_dir = artifacts_dir / "background_uncertainty"
+        bg_protect_dir = artifacts_dir / "background_protect"
         candidate_dir = artifacts_dir / "candidates"
         field_dir = artifacts_dir / "residual_fields"
-        for path in (mask_dir, edit_mask_dir, context_mask_dir, protect_mask_dir, seed_dir, erase_dir, clean_dir, candidate_dir, field_dir):
+        for path in (
+            mask_dir,
+            edit_mask_dir,
+            context_mask_dir,
+            protect_mask_dir,
+            seed_dir,
+            erase_dir,
+            clean_dir,
+            bg_uncertainty_dir,
+            bg_protect_dir,
+            candidate_dir,
+            field_dir,
+        ):
             path.mkdir(parents=True, exist_ok=True)
 
         class_to_id = metadata.get("class_to_id") or {}
@@ -389,6 +411,29 @@ class DRFTGenerator:
                     )
                     erase_mask = _subtract_protect_mask(erase_mask, protect_mask)
                     background_canvas = create_composite_preserving_background(orig_resized, clean_canvas, erase_mask)
+                    background_projector_meta: dict[str, object] = {"enabled": False}
+                    background_uncertainty_path = bg_uncertainty_dir / f"{stem}_c{candidate_index:02d}_uncertainty.png"
+                    background_protect_path = bg_protect_dir / f"{stem}_c{candidate_index:02d}_protect.png"
+                    if background_projector is not None:
+                        bg_model, bg_cfg, _bg_payload = background_projector
+                        projection = apply_background_projector(
+                            bg_model,
+                            bg_cfg,
+                            orig_resized,
+                            scaled_bbox,
+                            erase_mask=erase_mask,
+                            fallback_canvas=background_canvas,
+                            checkpoint_path=background_projector_path,
+                            device="cpu",
+                        )
+                        background_canvas = projection.background
+                        projection.uncertainty.save(background_uncertainty_path)
+                        projection.protect_mask.save(background_protect_path)
+                        background_projector_meta = {
+                            **projection.meta,
+                            "uncertainty_path": str(background_uncertainty_path.resolve()),
+                            "protect_mask_path": str(background_protect_path.resolve()),
+                        }
                     prototype = prototype_bank.sample(cls_name, seed=candidate_seed, avoid_key=stem)
                     field = build_class_aware_defect_residual_field(
                         background_canvas,
@@ -555,6 +600,7 @@ class DRFTGenerator:
                         ),
                         "denoising_strength": float(denoising_strength),
                         "canvas": canvas_meta,
+                        "background_projector": background_projector_meta,
                         "residual_seed": seed_meta,
                         "context_contract": (
                             {

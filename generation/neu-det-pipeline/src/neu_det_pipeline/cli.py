@@ -23,7 +23,13 @@ from .data import (
     export_metadata,
     split_dataset,
 )
-from .models import DRFTGenerator, DRFTLoRAHyperParams, DRFTLoRATrainer
+from .models import (
+    BackgroundProjectorConfig,
+    BackgroundProjectorTrainer,
+    DRFTGenerator,
+    DRFTLoRAHyperParams,
+    DRFTLoRATrainer,
+)
 from .models.drft_lora import is_drft_lora_path, read_drft_lora_metadata
 from .prompts import CaptionGenerator, generate_captions_with_blip2, load_captions_from_file
 
@@ -333,6 +339,49 @@ def train_drft_lora(
     console.print(f"[green]Saved DRFT-LoRA adapter to {weights}[/green]")
 
 
+@app.command("train-bg-projector")
+def train_background_projector(
+    ctx: typer.Context,
+    dataset_root: Path = typer.Argument(..., exists=True, file_okay=False),
+    output_dir: Path = typer.Option(Path("outputs/background_projector"), "--output-dir", file_okay=False),
+    split_manifest: Optional[Path] = typer.Option(None, "--split-manifest"),
+    train_split: str = typer.Option("train", "--train-split"),
+    steps: int = typer.Option(500, "--steps"),
+    batch_size: int = typer.Option(4, "--batch-size"),
+    learning_rate: float = typer.Option(1e-3, "--learning-rate"),
+    resolution: int = typer.Option(512, "--resolution"),
+    base_channels: int = typer.Option(32, "--base-channels"),
+    max_train_samples: Optional[int] = typer.Option(None, "--max-train-samples"),
+    seed: Optional[int] = typer.Option(None, "--seed"),
+) -> None:
+    """Train the box-aware counterfactual background projector for DRFT-v2."""
+
+    bundle = _ensure_bundle(ctx)
+    samples = collect_dataset_instances(dataset_root)
+    train_samples = _filter_samples_for_split(samples, train_split, split_manifest)
+    if not train_samples:
+        raise typer.BadParameter(f"No samples matched split '{train_split}'.")
+    cfg = BackgroundProjectorConfig(
+        resolution=max(64, int(resolution)),
+        base_channels=max(8, int(base_channels)),
+        learning_rate=float(learning_rate),
+        steps=max(1, int(steps)),
+        batch_size=max(1, int(batch_size)),
+        seed=int(seed if seed is not None else bundle.generation.seed),
+    )
+    console.print(
+        f"[cyan]Training background projector on {len(train_samples)} instance target(s): "
+        f"{dict(sorted(Counter(sample.cls_name for sample in train_samples).items()))}[/cyan]"
+    )
+    trainer = BackgroundProjectorTrainer(cfg)
+    checkpoint = trainer.train(
+        train_samples,
+        output_dir,
+        max_train_samples=max_train_samples,
+    )
+    console.print(f"[green]Saved background projector to {checkpoint}[/green]")
+
+
 @app.command("generate")
 def generate_drft_v2(
     ctx: typer.Context,
@@ -369,6 +418,7 @@ def generate_drft_v2(
         True,
         "--drft-defect-first-selection/--no-drft-defect-first-selection",
     ),
+    bg_projector_path: Optional[Path] = typer.Option(None, "--bg-projector-path", exists=True),
     mixed_max_generated: Optional[int] = typer.Option(None, "--mixed-max-generated"),
     mixed_per_source_limit: int = typer.Option(0, "--mixed-per-source-limit"),
     mixed_per_class_limit: int = typer.Option(0, "--mixed-per-class-limit"),
@@ -470,6 +520,7 @@ def generate_drft_v2(
         residual_seed_gain=float(drft_residual_seed_gain),
         context_min_score=float(drft_context_min_score),
         defect_first_selection=bool(drft_defect_first_selection),
+        background_projector_path=bg_projector_path,
     )
 
     score_path = artifacts_dir / "drft_v2_lora" / "candidate_scores.jsonl"
@@ -501,6 +552,7 @@ def generate_drft_v2(
             "residual_seed_gain": float(drft_residual_seed_gain),
             "context_min_score": float(drft_context_min_score),
             "defect_first_selection": bool(drft_defect_first_selection),
+            "background_projector_path": str(bg_projector_path.resolve()) if bg_projector_path else None,
         },
     }
     _write_json(run_dir / "run_context.json", run_context)
