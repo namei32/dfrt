@@ -5,7 +5,7 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 from types import MethodType
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -138,6 +138,17 @@ class DRFTAttentionContext:
         self.class_ids: Optional[torch.Tensor] = None
         self.timestep: Optional[torch.Tensor] = None
         self._cache: Dict[Tuple[str, str, int, torch.dtype, int], torch.Tensor] = {}
+        self._trace_enabled = False
+        self._trace_event_count = 0
+        self._trace_sums: Dict[str, float] = {}
+        self._trace_metric_counts: Dict[str, int] = {}
+        self._trace_expert_weight_sums: List[float] = []
+        self._trace_timestep_min: Optional[float] = None
+        self._trace_timestep_max: Optional[float] = None
+        self._trace_phase_counts: Dict[str, int] = {}
+        self._trace_phase_sums: Dict[str, Dict[str, float]] = {}
+        self._trace_phase_metric_counts: Dict[str, Dict[str, int]] = {}
+        self._trace_phase_expert_weight_sums: Dict[str, List[float]] = {}
 
     def set_condition(self, residual_field: torch.Tensor, class_ids: torch.Tensor) -> None:
         if residual_field.ndim != 4 or residual_field.shape[1] != DRFT_FIELD_CHANNELS:
@@ -160,6 +171,195 @@ class DRFTAttentionContext:
         self.class_ids = None
         self.timestep = None
         self._cache.clear()
+        self._trace_enabled = False
+        self._reset_trace_state()
+
+    def _reset_trace_state(self) -> None:
+        self._trace_event_count = 0
+        self._trace_sums = {}
+        self._trace_metric_counts = {}
+        self._trace_expert_weight_sums = []
+        self._trace_timestep_min = None
+        self._trace_timestep_max = None
+        self._trace_phase_counts = {}
+        self._trace_phase_sums = {}
+        self._trace_phase_metric_counts = {}
+        self._trace_phase_expert_weight_sums = {}
+
+    def begin_trace(self, *, max_events: int = 96) -> None:
+        """Collect a lightweight summary of residual-bridge-guided adaptation.
+
+        ``max_events`` is kept for API compatibility; tracing now aggregates all
+        attention events online so early/mid/late timesteps are not biased by a
+        prefix-only sample.
+        """
+
+        del max_events
+        self._trace_enabled = True
+        self._reset_trace_state()
+
+    def _add_trace_metric(self, key: str, value: float, *, phase: Optional[str] = None) -> None:
+        self._trace_sums[key] = self._trace_sums.get(key, 0.0) + float(value)
+        self._trace_metric_counts[key] = self._trace_metric_counts.get(key, 0) + 1
+        if phase is None:
+            return
+        phase_sums = self._trace_phase_sums.setdefault(phase, {})
+        phase_counts = self._trace_phase_metric_counts.setdefault(phase, {})
+        phase_sums[key] = phase_sums.get(key, 0.0) + float(value)
+        phase_counts[key] = phase_counts.get(key, 0) + 1
+
+    def record_adaptation_event(
+        self,
+        *,
+        expert_weights: torch.Tensor,
+        alpha: torch.Tensor,
+        spatial: Optional[torch.Tensor],
+        time_features: torch.Tensor,
+    ) -> None:
+        if not self._trace_enabled:
+            return
+        with torch.no_grad():
+            weights = expert_weights.detach().float().cpu()
+            alpha_cpu = alpha.detach().float().cpu()
+            time_cpu = time_features.detach().float().cpu()
+            safe_weights = torch.clamp(weights, min=1e-8)
+            entropy = -(safe_weights * safe_weights.log()).sum(dim=-1)
+            if weights.shape[-1] > 1:
+                entropy = entropy / math.log(float(weights.shape[-1]))
+            expert_mean = [float(v) for v in weights.mean(dim=0).tolist()]
+            timestep_mean = float(time_cpu[:, 0].mean().item())
+            early_weight = float(time_cpu[:, 2].mean().item())
+            mid_weight = float(time_cpu[:, 3].mean().item())
+            late_weight = float(time_cpu[:, 4].mean().item())
+            phase = max(
+                (("early", early_weight), ("mid", mid_weight), ("late", late_weight)),
+                key=lambda item: item[1],
+            )[0]
+            self._trace_event_count += 1
+            self._trace_phase_counts[phase] = self._trace_phase_counts.get(phase, 0) + 1
+            if not self._trace_expert_weight_sums:
+                self._trace_expert_weight_sums = [0.0 for _ in expert_mean]
+            for idx, value in enumerate(expert_mean):
+                if idx >= len(self._trace_expert_weight_sums):
+                    self._trace_expert_weight_sums.append(0.0)
+                self._trace_expert_weight_sums[idx] += float(value)
+            phase_expert = self._trace_phase_expert_weight_sums.setdefault(
+                phase, [0.0 for _ in expert_mean]
+            )
+            for idx, value in enumerate(expert_mean):
+                if idx >= len(phase_expert):
+                    phase_expert.append(0.0)
+                phase_expert[idx] += float(value)
+
+            self._trace_timestep_min = (
+                timestep_mean
+                if self._trace_timestep_min is None
+                else min(self._trace_timestep_min, timestep_mean)
+            )
+            self._trace_timestep_max = (
+                timestep_mean
+                if self._trace_timestep_max is None
+                else max(self._trace_timestep_max, timestep_mean)
+            )
+            self._add_trace_metric("expert_entropy", float(entropy.mean().item()), phase=phase)
+            self._add_trace_metric("alpha_mean", float(alpha_cpu.mean().item()), phase=phase)
+            self._add_trace_metric("alpha_max", float(alpha_cpu.max().item()), phase=phase)
+            self._add_trace_metric("timestep_mean", timestep_mean, phase=phase)
+            self._add_trace_metric("early_weight", early_weight, phase=phase)
+            self._add_trace_metric("mid_weight", mid_weight, phase=phase)
+            self._add_trace_metric("late_weight", late_weight, phase=phase)
+            if spatial is not None:
+                spatial_cpu = spatial.detach().float().cpu()
+                self._add_trace_metric(
+                    "spatial_gate_mean",
+                    float(spatial_cpu.mean().item()),
+                    phase=phase,
+                )
+                self._add_trace_metric(
+                    "spatial_gate_max",
+                    float(spatial_cpu.max().item()),
+                    phase=phase,
+                )
+                self._add_trace_metric(
+                    "spatial_gate_coverage",
+                    float((spatial_cpu > 0.35).float().mean().item()),
+                    phase=phase,
+                )
+
+    def end_trace(self) -> Dict[str, Any]:
+        was_enabled = bool(self._trace_enabled)
+        event_count = int(self._trace_event_count)
+        sums = dict(self._trace_sums)
+        counts = dict(self._trace_metric_counts)
+        expert_sums = list(self._trace_expert_weight_sums)
+        timestep_min = self._trace_timestep_min
+        timestep_max = self._trace_timestep_max
+        phase_counts = dict(self._trace_phase_counts)
+        phase_sums = {phase: dict(values) for phase, values in self._trace_phase_sums.items()}
+        phase_metric_counts = {
+            phase: dict(values) for phase, values in self._trace_phase_metric_counts.items()
+        }
+        phase_expert_sums = {
+            phase: list(values) for phase, values in self._trace_phase_expert_weight_sums.items()
+        }
+        self._trace_enabled = False
+        self._reset_trace_state()
+        if not was_enabled:
+            return {"enabled": False, "event_count": 0}
+        if event_count <= 0:
+            return {
+                "enabled": True,
+                "event_count": 0,
+                "warning": "trace_enabled_but_no_adaptation_events",
+            }
+
+        def mean_value(key: str) -> Optional[float]:
+            count = counts.get(key, 0)
+            return float(sums[key] / count) if count else None
+
+        def phase_mean(phase: str, key: str) -> Optional[float]:
+            count = phase_metric_counts.get(phase, {}).get(key, 0)
+            if not count:
+                return None
+            return float(phase_sums[phase][key] / count)
+
+        expert_weight_mean = [float(value / event_count) for value in expert_sums]
+        phase_summary: Dict[str, Dict[str, Any]] = {}
+        for phase in ("early", "mid", "late"):
+            count = int(phase_counts.get(phase, 0))
+            expert_values = phase_expert_sums.get(phase, [])
+            phase_summary[phase] = {
+                "event_count": count,
+                "expert_weight_mean": (
+                    [float(value / count) for value in expert_values]
+                    if count > 0
+                    else []
+                ),
+                "expert_entropy_mean": phase_mean(phase, "expert_entropy"),
+                "alpha_mean": phase_mean(phase, "alpha_mean"),
+                "spatial_gate_mean": phase_mean(phase, "spatial_gate_mean"),
+                "spatial_gate_coverage_mean": phase_mean(phase, "spatial_gate_coverage"),
+                "timestep_mean": phase_mean(phase, "timestep_mean"),
+            }
+        return {
+            "enabled": True,
+            "event_count": event_count,
+            "truncated": False,
+            "expert_weight_mean": expert_weight_mean,
+            "expert_entropy_mean": mean_value("expert_entropy"),
+            "alpha_mean": mean_value("alpha_mean"),
+            "alpha_max_mean": mean_value("alpha_max"),
+            "spatial_gate_mean": mean_value("spatial_gate_mean"),
+            "spatial_gate_max_mean": mean_value("spatial_gate_max"),
+            "spatial_gate_coverage_mean": mean_value("spatial_gate_coverage"),
+            "early_weight_mean": mean_value("early_weight"),
+            "mid_weight_mean": mean_value("mid_weight"),
+            "late_weight_mean": mean_value("late_weight"),
+            "timestep_min": timestep_min,
+            "timestep_max": timestep_max,
+            "phase_event_counts": {phase: int(phase_counts.get(phase, 0)) for phase in ("early", "mid", "late")},
+            "phase_summary": phase_summary,
+        }
 
     @staticmethod
     def _repeat_to_batch(tensor: torch.Tensor, batch: int) -> torch.Tensor:
@@ -310,6 +510,12 @@ class DRFTAttnProcessor2_0(nn.Module):
             batch=batch,
             device=hidden_states.device,
             dtype=hidden_states.dtype,
+        )
+        self.context.record_adaptation_event(
+            expert_weights=expert_weights,
+            alpha=alpha,
+            spatial=spatial,
+            time_features=time_features,
         )
         return expert_weights, alpha, spatial
 
